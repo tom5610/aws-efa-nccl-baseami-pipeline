@@ -1,0 +1,222 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Metadata:
+  License: Apache-2.0
+Description: 'AWS CloudFormation Sample Template to help setup GPU monitoring, EC2 instance health check monitoring, and
+  Personal Health Dashboard monitoring.'
+Parameters:
+  KeyName:
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+    Type: AWS::EC2::KeyPair::KeyName
+    ConstraintDescription: must be the name of an existing EC2 KeyPair.
+  InstanceType:
+    Description: WebServer EC2 instance type
+    Type: String
+    Default: g4dn.xlarge
+  SSHLocation:
+    Description: The IP address range that can be used to SSH to the EC2 instances
+    Type: String
+    MinLength: 9
+    MaxLength: 18
+    Default: 119.18.3.143/32
+    AllowedPattern: (\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})/(\d{1,2})
+    ConstraintDescription: must be a valid IP CIDR range of the form x.x.x.x/x.
+  LatestAmiId:
+    Type:  String
+    Default: 'ami-023449dfd9a234ca3'
+    Description: 'Deep Learning AMI (Ubuntu 18.04) Version 53.0 or customised AMI.'
+  SubnetId:
+    Type:  String
+    Default: subnet-ab04ece3
+    Description: Instance subnet id.
+  VpcId:
+    Type: String
+    Default: vpc-2e4d5b49
+  Email:
+    Type: String
+  LogGroupName:
+    Type: String
+    Default: 'accel-error-log'
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref 'InstanceType'
+      KeyName: !Ref 'KeyName'
+      ImageId: !Ref 'LatestAmiId'
+      IamInstanceProfile: !Ref 'EC2CWAgentInstanceProfile'
+      NetworkInterfaces: 
+        - AssociatePublicIpAddress: "true"
+          DeviceIndex: "0"
+          GroupSet: 
+            - Ref: "InstanceSecurityGroup"
+          SubnetId: 
+            Ref: 'SubnetId'
+      UserData: 
+        Fn::Base64:
+          !Sub |
+            #!/bin/bash -xe
+            sudo /usr/local/bin/pip3 install boto3
+            sudo mkdir -p /opt/aws
+            sudo wget -O /tmp/cwa.deb 'https://s3.amazonaws.com/amazoncloudwatch-agent/debian/amd64/latest/amazon-cloudwatch-agent.deb'
+            sudo dpkg -i /tmp/cwa.deb
+            git clone https://github.com/aws-samples/aws-efa-nccl-baseami-pipeline.git /tmp/aws-efa-nccl-baseami
+            sudo mv /tmp/aws-efa-nccl-baseami/nvidia-efa-ami_base/cloudwatch /opt/aws/
+            sudo mv /opt/aws/cloudwatch/aws-hw-monitor.service /lib/systemd/system
+            echo -e '#!/bin/sh\n' | sudo tee /opt/aws/cloudwatch/aws-cloudwatch-wrapper.sh
+            echo -e '/usr/bin/python3 /opt/aws/cloudwatch/nvidia/aws-hwaccel-error-parser.py &' | sudo tee -a /opt/aws/cloudwatch/aws-cloudwatch-wrapper.sh
+            echo -e '/usr/bin/python3 /opt/aws/cloudwatch/nvidia/accel-to-cw.py /opt/aws/cloudwatch/nvidia/nvidia-exporter >> /dev/null 2>&1 &\n' | sudo tee -a /opt/aws/cloudwatch/aws-cloudwatch-wrapper.sh
+
+            # do we still need efa-exporter if it's being run on non-efa setting?
+            echo -e '/usr/bin/python3 /opt/aws/cloudwatch/efa/efa-to-cw.py /opt/aws/cloudwatch/efa/efa-exporter >> /dev/null 2>&1 &\n' | sudo tee -a /opt/aws/cloudwatch/aws-cloudwatch-wrapper.sh
+            sudo chmod +x /opt/aws/cloudwatch/aws-cloudwatch-wrapper.sh
+
+            # config.json file to setup CloudWatch log group naming, etc. 
+            sudo cp /opt/aws/cloudwatch/nvidia/cwa-config.json /opt/aws/amazon-cloudwatch-agent/bin/config.json
+            sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -c file:/opt/aws/amazon-cloudwatch-agent/bin/config.json -s
+            sudo systemctl enable aws-hw-monitor.service
+            sudo systemctl enable amazon-cloudwatch-agent.service
+            sudo systemctl restart aws-hw-monitor.service
+            sudo systemctl restart amazon-cloudwatch-agent.service
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Enable SSH access via port 22
+      VpcId: 
+        Ref: VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: !Ref 'SSHLocation'
+
+  EC2CWAgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ec2.amazonaws.com
+          Action:
+          - sts:AssumeRole
+      Path: "/"
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy"
+
+  EC2CWAgentInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+      - Ref: EC2CWAgentRole
+
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      Subscription:
+      - Endpoint:
+          Ref: Email
+        Protocol: email      
+
+  GPUXidMessageOccurredMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Properties:
+      LogGroupName:
+        Ref: LogGroupName
+      FilterPattern: '"NVRM: Xid"'
+      MetricTransformations:
+      - MetricNamespace: GPUXidMessageMetrics
+        MetricName: !Sub
+          - GPUXidMessage-${InstanceId}
+          - { InstanceId: !Ref 'EC2Instance' }
+        MetricValue: '1'
+
+  GPUXidMessageOccuringAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: GPUXidMessageOccuring
+      AlarmDescription: Alarms when GPU Xid message occurred in logs. 
+      AlarmActions:
+      - Ref: AlarmNotificationTopic
+      Namespace: GPUXidMessageMetrics
+      MetricName: !Sub
+          - GPUXidMessage-${InstanceId}
+          - { InstanceId: !Ref 'EC2Instance' }
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      EvaluationPeriods: '1'
+      Period: '60'
+      Statistic: Sum
+      Threshold: '1'        
+
+  EC2InstanceStatusCheckAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub
+          - EC2InstanceStatusCheckAlarm-${InstanceId}
+          - { InstanceId: !Ref 'EC2Instance' }
+      AlarmDescription: Notify Topic subscribers on health check event.
+      AlarmActions:
+      - Ref: AlarmNotificationTopic
+      Namespace: AWS/EC2
+      MetricName: StatusCheckFailed
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref EC2Instance
+      EvaluationPeriods: 2
+      Period: 60
+      Statistic: Minimum
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 0
+
+  EC2InstancePHDScheduleEventRule: 
+    Type: AWS::Events::Rule
+    Properties: 
+      Description: Capture PHD notification on EC2 Instance
+      EventBusName: default
+      EventPattern: 
+        source:
+          - aws.health
+        detail-type: 
+          - "AWS Health Event"
+        detail: 
+          service: 
+            - EC2
+          eventTypeCategory: 
+            - scheduledChange
+        resources:
+          - !Sub 
+            - "arn:aws:ec2:${AWS::Region}:${AWS::AccountId}:instance/${InstanceId}"
+            - { InstanceId: !Ref 'EC2Instance' }
+      State: "ENABLED"
+      Targets: 
+        - Arn: !Ref AlarmNotificationTopic
+          Id: psd-instance-event
+
+  EventTopicPolicy:
+    Type: 'AWS::SNS::TopicPolicy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: 'sns:Publish'
+            Resource: '*'
+      Topics:
+        - !Ref AlarmNotificationTopic
+
+Outputs:
+  InstanceId:
+    Description: InstanceId of the newly created EC2 instance
+    Value: !Ref 'EC2Instance'
+  AZ:
+    Description: Availability Zone of the newly created EC2 instance
+    Value: !GetAtt [EC2Instance, AvailabilityZone]
+  PublicDNS:
+    Description: Public DNSName of the newly created EC2 instance
+    Value: !GetAtt [EC2Instance, PublicDnsName]
+  PublicIP:
+    Description: Public IP address of the newly created EC2 instance
+    Value: !GetAtt [EC2Instance, PublicIp]
